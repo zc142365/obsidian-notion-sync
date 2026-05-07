@@ -1,7 +1,7 @@
 {
-  "name": "obsidian-notion-sync",
+  "name": "notion-sync",
   "version": "0.1.0",
-  "description": "Obsidian plugin that syncs Markdown notes to Notion.",
+  "description": "Plugin that syncs Markdown notes to Notion.",
   "author": "JongSim",
   "main": "main.js",
   "scripts": {

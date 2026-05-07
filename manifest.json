@@ -1,9 +1,9 @@
 {
-  "id": "obsidian-notion-sync",
-  "name": "Obsidian Notion Sync",
+  "id": "notion-sync",
+  "name": "Notion Sync",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Sync Obsidian Markdown notes and attachments to Notion pages while preserving folder structure.",
+  "description": "Sync Markdown notes and attachments to Notion pages while preserving folder structure.",
   "author": "JongSim",
   "authorUrl": "",
   "isDesktopOnly": false
