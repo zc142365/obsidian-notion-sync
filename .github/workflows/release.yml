@@ -92,7 +92,7 @@ jobs:
         with:
           tag_name: ${{ steps.meta.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          name: Obsidian Notion Sync ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_version }}
           draft: false
           prerelease: false
           files: |
