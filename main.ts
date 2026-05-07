@@ -388,6 +388,12 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     return error instanceof NotionApiError && error.html403;
   }
 
+  private isArchivedBlockError(error: unknown) {
+    if (!(error instanceof NotionApiError) || error.status !== 400) return false;
+    const message = error.message.toLowerCase();
+    return message.includes('archived') && (message.includes('block') || message.includes('ancestor'));
+  }
+
   private neutralizeWafText(text: string) {
     if (!text) return text;
     const words = WAF_SENSITIVE_WORDS
@@ -1008,7 +1014,13 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       const query = cursor ? `?page_size=100&start_cursor=${encodeURIComponent(cursor)}` : '?page_size=100';
       const response = await this.apiRequest('GET', `/blocks/${pageId}/children${query}`);
       for (const block of response.json.results ?? []) {
-        await this.apiRequest('DELETE', `/blocks/${block.id}`);
+        if (block.archived || block.in_trash) continue;
+        try {
+          await this.apiRequest('DELETE', `/blocks/${block.id}`);
+        } catch (err) {
+          if (this.isArchivedBlockError(err)) continue;
+          throw err;
+        }
       }
       if (!response.json.has_more) break;
       cursor = response.json.next_cursor;
