@@ -1,0 +1,102 @@
+name: Release Obsidian Plugin
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - '*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Read release metadata
+        id: meta
+        shell: bash
+        run: |
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+            RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            RELEASE_VERSION="${MANIFEST_VERSION}"
+            RELEASE_TAG="v${MANIFEST_VERSION}"
+          fi
+          echo "manifest_version=${MANIFEST_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate plugin metadata versions
+        shell: bash
+        run: |
+          MANIFEST_VERSION="${{ steps.meta.outputs.manifest_version }}"
+          PACKAGE_VERSION="${{ steps.meta.outputs.package_version }}"
+          VERSIONS_HAS_ENTRY=$(node -p "Object.prototype.hasOwnProperty.call(require('./versions.json'), require('./manifest.json').version)")
+          TAG_VERSION="${{ steps.meta.outputs.release_version }}"
+          if [ "${MANIFEST_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "::error::manifest.json version (${MANIFEST_VERSION}) must match release version (${TAG_VERSION})."
+            exit 1
+          fi
+          if [ "${PACKAGE_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "::error::package.json version (${PACKAGE_VERSION}) must match release version (${TAG_VERSION})."
+            exit 1
+          fi
+          if [ "${VERSIONS_HAS_ENTRY}" != "true" ]; then
+            echo "::error::versions.json must contain an entry for ${MANIFEST_VERSION}."
+            exit 1
+          fi
+
+      - name: Validate required release files
+        shell: bash
+        run: |
+          test -f manifest.json || (echo "::error::manifest.json missing" && exit 1)
+          test -f main.js || (echo "::error::main.js missing; build failed" && exit 1)
+          test -f styles.css || (echo "::error::styles.css missing" && exit 1)
+
+      - name: Create release package
+        shell: bash
+        run: |
+          PLUGIN_ID=$(node -p "require('./manifest.json').id")
+          VERSION=$(node -p "require('./manifest.json').version")
+          mkdir -p dist/${PLUGIN_ID}
+          cp manifest.json main.js styles.css dist/${PLUGIN_ID}/
+          cd dist
+          zip -r ${PLUGIN_ID}-${VERSION}.zip ${PLUGIN_ID}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Obsidian Notion Sync ${{ steps.meta.outputs.release_tag }}
+          draft: false
+          prerelease: false
+          files: |
+            manifest.json
+            main.js
+            styles.css
+            dist/*.zip
