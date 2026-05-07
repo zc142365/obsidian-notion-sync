@@ -3,7 +3,7 @@
   "name": "Notion Sync",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Sync Markdown notes, attachments, and folder structure to Notion.",
+  "description": "Sync Markdown notes, file attachments, and folder structure to Notion.",
   "author": "JongSim",
   "authorUrl": "",
   "isDesktopOnly": false
