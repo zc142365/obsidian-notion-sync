@@ -109,4 +109,4 @@ Release assets required by Obsidian:
 
 ## License
 
-MIT
+Apache-2.0
