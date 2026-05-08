@@ -107,6 +107,33 @@ interface InlineContext {
   mdFile: TFile;
 }
 
+interface NotionRichTextText {
+  type: 'text';
+  text: {
+    content: string;
+    link?: { url: string };
+  };
+  annotations?: Record<string, unknown>;
+}
+
+interface NotionMentionRichText {
+  type: 'mention';
+  mention: {
+    type: 'page';
+    page: { id: string };
+  };
+}
+
+type NotionRichText = NotionRichTextText | NotionMentionRichText;
+
+interface NotionBlock {
+  object: 'block';
+  type: string;
+  [key: string]: unknown;
+}
+
+type SyncResult = 'created' | 'updated' | 'recreated' | 'skipped';
+
 class NotionApiError extends Error {
   constructor(
     message: string,
@@ -218,11 +245,32 @@ function textChunks(content: string, size = 1900) {
   return chunks.length ? chunks : [''];
 }
 
-function richTextNode(content: string, annotations?: Record<string, unknown>, link?: string) {
-  const node: any = { type: 'text', text: { content } };
-  if (link) node.text.link = { url: link };
+function richTextNode(content: string, annotations?: Record<string, unknown>, link?: string): NotionRichTextText {
+  const text: NotionRichTextText['text'] = { content };
+  if (link) text.link = { url: link };
+  const node: NotionRichTextText = { type: 'text', text };
   if (annotations) node.annotations = annotations;
   return node;
+}
+
+function pageMentionNode(pageId: string): NotionMentionRichText {
+  return { type: 'mention', mention: { type: 'page', page: { id: pageId } } };
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function asString(value: unknown) {
+  return typeof value === 'string' ? value : undefined;
 }
 
 function arrayBufferToHex(buffer: ArrayBuffer) {
@@ -281,6 +329,11 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
   private syncInProgress = false;
   private debounceTimers = new Map<string, number>();
 
+  private isInsideConfigDir(file: TFile) {
+    const configDir = normalizePath(this.app.vault.configDir);
+    return file.path === configDir || file.path.startsWith(`${configDir}/`);
+  }
+
   async onload() {
     await this.loadPluginData();
 
@@ -334,7 +387,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
         this.debounceTimers.delete(file.path);
         this.syncOneFile(file, false).catch((err) => {
           console.error(err);
-          new Notice(`Notion sync error: ${err.message ?? err}`);
+          new Notice(`Notion sync error: ${errorMessage(err)}`);
         });
       }, 1500);
       this.debounceTimers.set(file.path, timer);
@@ -410,24 +463,27 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     return safe;
   }
 
-  private makeWafSafeBlock(block: any) {
+  private makeWafSafeBlock(block: NotionBlock) {
     let changed = false;
-    const safe = JSON.parse(JSON.stringify(block));
+    const safe = JSON.parse(JSON.stringify(block)) as NotionBlock;
 
-    const visit = (value: any) => {
+    const visit = (value: unknown) => {
       if (Array.isArray(value)) {
         value.forEach(visit);
         return;
       }
       if (!value || typeof value !== 'object') return;
-      if (value.type === 'text' && value.text && typeof value.text.content === 'string') {
-        const next = this.neutralizeWafText(value.text.content);
-        if (next !== value.text.content) {
-          value.text.content = next;
+      const node = value as Record<string, unknown>;
+      const text = asObject(node.text);
+      const content = asString(text.content);
+      if (node.type === 'text' && content !== undefined) {
+        const next = this.neutralizeWafText(content);
+        if (next !== content) {
+          text.content = next;
           changed = true;
         }
       }
-      Object.values(value).forEach(visit);
+      Object.values(node).forEach(visit);
     };
 
     visit(safe);
@@ -469,7 +525,8 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
             true
           );
         }
-        const message = response.json?.message ?? response.text ?? `HTTP ${response.status}`;
+        const responseJson = asObject(response.json);
+        const message = asString(responseJson.message) ?? response.text ?? `HTTP ${response.status}`;
         throw new NotionApiError(`Notion API ${response.status}: ${message}`, response.status);
       }
 
@@ -485,8 +542,8 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       await this.savePluginData();
       await this.apiRequest('GET', `/pages/${this.settings.parentPageId}`);
       new Notice('Notion 연결 성공');
-    } catch (err: any) {
-      new Notice(`Notion 연결 실패: ${err.message ?? err}`);
+    } catch (err) {
+      new Notice(`Notion 연결 실패: ${errorMessage(err)}`);
     }
   }
 
@@ -509,8 +566,8 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       const url = this.buildOAuthAuthorizeUrl();
       window.open(url, '_blank');
       new Notice('브라우저에서 Notion 권한 승인 후 redirect URL 전체를 복사해 붙여넣으세요.');
-    } catch (err: any) {
-      new Notice(`OAuth URL 생성 실패: ${err.message ?? err}`);
+    } catch (err) {
+      new Notice(`OAuth URL 생성 실패: ${errorMessage(err)}`);
     }
   }
 
@@ -553,18 +610,20 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       });
 
       if (response.status < 200 || response.status >= 300) {
-        const message = response.json?.error_description ?? response.json?.message ?? response.text ?? `HTTP ${response.status}`;
+        const responseJson = asObject(response.json);
+        const message = asString(responseJson.error_description) ?? asString(responseJson.message) ?? response.text ?? `HTTP ${response.status}`;
         throw new Error(message);
       }
 
-      this.settings.notionToken = response.json.access_token ?? '';
-      this.settings.oauthWorkspaceName = response.json.workspace_name ?? '';
-      this.settings.oauthBotId = response.json.bot_id ?? '';
+      const responseJson = asObject(response.json);
+      this.settings.notionToken = asString(responseJson.access_token) ?? '';
+      this.settings.oauthWorkspaceName = asString(responseJson.workspace_name) ?? '';
+      this.settings.oauthBotId = asString(responseJson.bot_id) ?? '';
       this.settings.oauthCodeInput = '';
       await this.savePluginData();
       new Notice(`Notion OAuth 연결 성공${this.settings.oauthWorkspaceName ? `: ${this.settings.oauthWorkspaceName}` : ''}`);
-    } catch (err: any) {
-      new Notice(`OAuth 토큰 교환 실패: ${err.message ?? err}`);
+    } catch (err) {
+      new Notice(`OAuth 토큰 교환 실패: ${errorMessage(err)}`);
     }
   }
 
@@ -573,13 +632,13 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     this.settings.oauthWorkspaceName = '';
     this.settings.oauthBotId = '';
     await this.savePluginData();
-    new Notice('Notion OAuth 토큰을 삭제했습니다.');
+    new Notice('Notion OAUTH 토큰을 삭제했습니다.');
   }
 
   private getMarkdownFiles() {
     return this.app.vault
       .getMarkdownFiles()
-      .filter((file) => !file.path.startsWith('.obsidian/'))
+      .filter((file) => !this.isInsideConfigDir(file))
       .sort((a, b) => a.path.localeCompare(b.path, 'ko'));
   }
 
@@ -623,7 +682,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     if (!fileName) return null;
     return this.app.vault
       .getFiles()
-      .find((file) => !file.path.startsWith('.obsidian/') && file.name.toLowerCase() === fileName) ?? null;
+      .find((file) => file instanceof TFile && !this.isInsideConfigDir(file) && file.name.toLowerCase() === fileName) ?? null;
   }
 
   private async uploadFileToNotion(file: TFile) {
@@ -634,7 +693,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
 
     const fileSize = data.byteLength;
     const contentType = this.contentTypeForPath(file.path);
-    const createPayload: any = fileSize <= SINGLE_UPLOAD_LIMIT
+    const createPayload: Record<string, unknown> = fileSize <= SINGLE_UPLOAD_LIMIT
       ? { filename: file.name, content_type: contentType }
       : {
           mode: 'multi_part',
@@ -644,7 +703,8 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
         };
 
     const createResponse = await this.apiRequest('POST', '/file_uploads', createPayload);
-    const fileUploadId = createResponse.json.id as string;
+    const fileUploadId = asString(asObject(createResponse.json).id);
+    if (!fileUploadId) throw new Error('Notion file upload ID가 응답에 없습니다.');
     const sendHeaders = this.notionHeaders(false);
 
     if (fileSize <= SINGLE_UPLOAD_LIMIT) {
@@ -683,12 +743,12 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     return fileUploadId;
   }
 
-  private async makeFileBlock(ref: string, mdFile: TFile, caption = '', ctx?: InlineContext) {
+  private async makeFileBlock(ref: string, mdFile: TFile, caption = '', ctx?: InlineContext): Promise<NotionBlock> {
     if (/^https?:\/\//i.test(ref)) {
       const blockType = this.blockTypeForPath(ref);
-      const payload: any = { type: 'external', external: { url: ref } };
+      const payload: Record<string, unknown> = { type: 'external', external: { url: ref } };
       if (caption) payload.caption = await this.parseInline(caption, ctx);
-      return { object: 'block', type: blockType, [blockType]: payload };
+      return { object: 'block', type: blockType, [blockType]: payload } as NotionBlock;
     }
 
     const localFile = this.resolveLocalFile(ref, mdFile);
@@ -697,11 +757,11 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     try {
       const uploadId = await this.uploadFileToNotion(localFile);
       const blockType = this.blockTypeForPath(localFile.path);
-      const payload: any = { type: 'file_upload', file_upload: { id: uploadId } };
+      const payload: Record<string, unknown> = { type: 'file_upload', file_upload: { id: uploadId } };
       if (caption) payload.caption = await this.parseInline(caption, ctx);
-      return { object: 'block', type: blockType, [blockType]: payload };
-    } catch (err: any) {
-      return this.block('paragraph', `⚠️ 파일 업로드 실패 (${ref}): ${err.message ?? err}`, ctx);
+      return { object: 'block', type: blockType, [blockType]: payload } as NotionBlock;
+    } catch (err) {
+      return this.block('paragraph', `⚠️ 파일 업로드 실패 (${ref}): ${errorMessage(err)}`, ctx);
     }
   }
 
@@ -718,8 +778,8 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     if (this.deadPages.has(pageId)) return false;
     try {
       const response = await this.apiRequest('GET', `/pages/${pageId}`);
-      const data = response.json;
-      const alive = !data.archived && !data.in_trash;
+      const data = asObject(response.json);
+      const alive = data.archived !== true && data.in_trash !== true;
       if (!alive) this.deadPages.add(pageId);
       return alive;
     } catch {
@@ -768,11 +828,11 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     return null;
   }
 
-  private async parseInline(text: string, ctx?: InlineContext): Promise<any[]> {
+  private async parseInline(text: string, ctx?: InlineContext): Promise<NotionRichText[]> {
     if (!text) return [];
-    const pattern = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|~~[^~\n]+~~|`[^`\n]+`|\[\[[^\]\n]+\]\]|!\[[^\]]*\]\([^\)\n]+\)|\[[^\]\n]+\]\([^\)\n]+\))/g;
+    const pattern = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|~~[^~\n]+~~|`[^`\n]+`|\[\[[^\]\n]+\]\]|!\[[^\]]*\]\([^\n)]+\)|\[[^\]\n]+\]\([^\n)]+\))/g;
     const parts = text.split(pattern).filter(Boolean);
-    const rich: any[] = [];
+    const rich: NotionRichText[] = [];
 
     for (const part of parts) {
       let annotations: Record<string, unknown> | undefined;
@@ -798,7 +858,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
         const display = pieces[pieces.length - 1].trim();
         const pageId = ctx ? await this.findPageIdByName(target, ctx.mdFile) : null;
         if (pageId) {
-          rich.push({ type: 'mention', mention: { type: 'page', page: { id: pageId } } });
+          rich.push(pageMentionNode(pageId));
           continue;
         }
         content = display;
@@ -814,7 +874,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
           if (!/^(https?:\/\/|#|mailto:)/i.test(url)) {
             const pageId = ctx ? await this.findPageIdByName(url, ctx.mdFile) : null;
             if (pageId) {
-              rich.push({ type: 'mention', mention: { type: 'page', page: { id: pageId } } });
+              rich.push(pageMentionNode(pageId));
               continue;
             }
           } else if (/^(https?:\/\/|mailto:)/i.test(url)) {
@@ -828,17 +888,18 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     return rich;
   }
 
-  private async block(type: string, text?: string, ctx?: InlineContext, extra: Record<string, unknown> = {}) {
-    const payload: any = { object: 'block', type, [type]: {} };
+  private async block(type: string, text?: string, ctx?: InlineContext, extra: Record<string, unknown> = {}): Promise<NotionBlock> {
+    const payload: NotionBlock = { object: 'block', type, [type]: {} };
+    const blockBody = payload[type] as Record<string, unknown>;
     if (text !== undefined) {
       const rich = await this.parseInline(text, ctx);
-      payload[type].rich_text = rich.length ? rich : [richTextNode('')];
+      blockBody.rich_text = rich.length ? rich : [richTextNode('')];
     }
-    Object.assign(payload[type], extra);
+    Object.assign(blockBody, extra);
     return payload;
   }
 
-  private async parseMarkdown(markdown: string, mdFile: TFile) {
+  private async parseMarkdown(markdown: string, mdFile: TFile): Promise<NotionBlock[]> {
     const ctx: InlineContext = { state: this.syncState, mdFile };
     let md = markdown;
     if (md.startsWith('---\n')) {
@@ -846,7 +907,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       if (end !== -1) md = md.slice(end + 5);
     }
 
-    const blocks: any[] = [];
+    const blocks: NotionBlock[] = [];
     const lines = md.split('\n');
     let i = 0;
 
@@ -968,23 +1029,24 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       || /^\d+\.\s/.test(s);
   }
 
-  private async createPage(title: string, parentId: string, blocks: any[] = []) {
-    const payload: any = {
+  private async createPage(title: string, parentId: string, blocks: NotionBlock[] = []) {
+    const payload: Record<string, unknown> = {
       parent: { page_id: parentId },
       properties: { title: { title: [richTextNode(title.slice(0, 2000))] } }
     };
 
     const response = await this.apiRequest('POST', '/pages', payload);
-    const pageId = response.json.id as string;
+    const pageId = asString(asObject(response.json).id);
+    if (!pageId) throw new Error('Notion page ID가 응답에 없습니다.');
     await this.appendBlocks(pageId, blocks);
     return pageId;
   }
 
-  private async appendBlocksRaw(pageId: string, blocks: any[]) {
+  private async appendBlocksRaw(pageId: string, blocks: NotionBlock[]) {
     await this.apiRequest('PATCH', `/blocks/${pageId}/children`, { children: blocks });
   }
 
-  private async appendBlocks(pageId: string, blocks: any[]) {
+  private async appendBlocks(pageId: string, blocks: NotionBlock[]) {
     if (!blocks.length) return;
 
     for (let i = 0; i < blocks.length; i += BLOCK_APPEND_BATCH_SIZE) {
@@ -1013,21 +1075,25 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
     while (true) {
       const query = cursor ? `?page_size=100&start_cursor=${encodeURIComponent(cursor)}` : '?page_size=100';
       const response = await this.apiRequest('GET', `/blocks/${pageId}/children${query}`);
-      for (const block of response.json.results ?? []) {
-        if (block.archived || block.in_trash) continue;
+      const responseJson = asObject(response.json);
+      for (const value of asArray(responseJson.results)) {
+        const block = asObject(value);
+        if (block.archived === true || block.in_trash === true) continue;
+        const blockId = asString(block.id);
+        if (!blockId) continue;
         try {
-          await this.apiRequest('DELETE', `/blocks/${block.id}`);
+          await this.apiRequest('DELETE', `/blocks/${blockId}`);
         } catch (err) {
           if (this.isArchivedBlockError(err)) continue;
           throw err;
         }
       }
-      if (!response.json.has_more) break;
-      cursor = response.json.next_cursor;
+      if (responseJson.has_more !== true) break;
+      cursor = asString(responseJson.next_cursor);
     }
   }
 
-  private async updatePage(pageId: string, blocks: any[]) {
+  private async updatePage(pageId: string, blocks: NotionBlock[]) {
     await this.clearBlocks(pageId);
     await this.appendBlocks(pageId, blocks);
   }
@@ -1160,9 +1226,9 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       const action = await this.syncFile(file, parentId, force);
       await this.savePluginData();
       new Notice(`Notion ${action}: ${file.path}`);
-    } catch (err: any) {
+    } catch (err) {
       console.error(err);
-      new Notice(`Notion sync error: ${err.message ?? err}`);
+      new Notice(`Notion sync error: ${errorMessage(err)}`);
     } finally {
       this.syncInProgress = false;
       this.setStatus('ready');
@@ -1195,7 +1261,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       }
 
       const forceUpdate = force || createdPlaceholders > 0;
-      const counts: Record<string, number> = { created: 0, updated: 0, recreated: 0, skipped: 0, error: 0 };
+      const counts: Record<SyncResult | 'error', number> = { created: 0, updated: 0, recreated: 0, skipped: 0, error: 0 };
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
@@ -1205,7 +1271,7 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
           const parentId = parentCache.get(folderPathForFile(file)) ?? await this.parentIdForFile(file);
           const action = await this.syncFile(file, parentId, forceUpdate);
           counts[action] += 1;
-          if (action !== 'skipped' || this.settings.verboseSkipped) console.log(`[${prefix}] [${action}] ${file.path}`);
+          if (action !== 'skipped' || this.settings.verboseSkipped) console.debug(`[${prefix}] [${action}] ${file.path}`);
         } catch (err) {
           counts.error += 1;
           console.error(`[${prefix}] [error] ${file.path}`, err);
@@ -1217,10 +1283,10 @@ export default class ObsidianNotionSyncPlugin extends Plugin {
       const summary = `완료: 생성 ${counts.created}, 갱신 ${counts.updated}, 재생성 ${counts.recreated}, 변경없음 ${counts.skipped}, 오류 ${counts.error}`;
       this.setStatus('ready');
       new Notice(summary, 8000);
-      console.log(`Notion sync ${summary}`);
-    } catch (err: any) {
+      console.debug(`Notion sync ${summary}`);
+    } catch (err) {
       console.error(err);
-      new Notice(`Notion sync error: ${err.message ?? err}`);
+      new Notice(`Notion sync error: ${errorMessage(err)}`);
       this.setStatus('error');
     } finally {
       this.syncInProgress = false;
@@ -1236,15 +1302,15 @@ class NotionSyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'Obsidian Notion Sync' });
+    new Setting(containerEl).setName('Connection').setHeading();
 
-    containerEl.createEl('h3', { text: 'Notion OAuth' });
+    new Setting(containerEl).setName('Notion OAUTH').setHeading();
 
     new Setting(containerEl)
-      .setName('OAuth client ID')
-      .setDesc('Notion public integration의 OAuth client ID입니다.')
+      .setName('OAUTH client ID')
+      .setDesc('Notion public integration의 OAUTH client ID입니다.')
       .addText((text) => text
-        .setPlaceholder('client id')
+        .setPlaceholder('Client ID')
         .setValue(this.plugin.settings.oauthClientId)
         .onChange(async (value) => {
           this.plugin.settings.oauthClientId = value.trim();
@@ -1252,12 +1318,12 @@ class NotionSyncSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('OAuth client secret')
+      .setName('OAUTH client secret')
       .setDesc('개인용 플러그인에서는 설정에 저장됩니다. 공개 배포 시에는 백엔드 프록시가 필요합니다.')
       .addText((text) => {
         text.inputEl.type = 'password';
         text
-          .setPlaceholder('client secret')
+          .setPlaceholder('Client secret')
           .setValue(this.plugin.settings.oauthClientSecret)
           .onChange(async (value) => {
             this.plugin.settings.oauthClientSecret = value.trim();
@@ -1266,10 +1332,10 @@ class NotionSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName('OAuth redirect URI')
-      .setDesc('Notion integration 설정에 등록한 redirect URI와 정확히 같아야 합니다.')
+      .setName('OAUTH redirect uri')
+      .setDesc('Notion integration 설정에 등록한 redirect uri와 정확히 같아야 합니다.')
       .addText((text) => text
-        .setPlaceholder('https://localhost/obsidian-notion-sync')
+        .setPlaceholder('Enter redirect URL')
         .setValue(this.plugin.settings.oauthRedirectUri)
         .onChange(async (value) => {
           this.plugin.settings.oauthRedirectUri = value.trim();
@@ -1280,15 +1346,15 @@ class NotionSyncSettingTab extends PluginSettingTab {
       .setName('Connect with Notion')
       .setDesc('브라우저에서 권한을 승인합니다. 승인 후 열린 redirect URL 전체를 아래 입력칸에 붙여넣으세요.')
       .addButton((button) => button
-        .setButtonText('Open Notion OAuth')
+        .setButtonText('Open Notion OAUTH')
         .setCta()
         .onClick(() => this.plugin.openNotionOAuth()));
 
     new Setting(containerEl)
-      .setName('OAuth redirect URL or code')
-      .setDesc('승인 후 브라우저 주소창의 전체 URL 또는 code 값만 붙여넣고 Exchange를 누릅니다.')
+      .setName('OAUTH redirect URL or code')
+      .setDesc('승인 후 브라우저 주소창의 전체 URL 또는 code 값만 붙여넣고 exchange를 누릅니다.')
       .addText((text) => text
-        .setPlaceholder('https://localhost/obsidian-notion-sync?code=... 또는 code')
+        .setPlaceholder('Enter redirect URL or code')
         .setValue(this.plugin.settings.oauthCodeInput)
         .onChange(async (value) => {
           this.plugin.settings.oauthCodeInput = value.trim();
@@ -1299,7 +1365,7 @@ class NotionSyncSettingTab extends PluginSettingTab {
         .onClick(() => this.plugin.exchangeOAuthCode()));
 
     new Setting(containerEl)
-      .setName('OAuth connection')
+      .setName('OAUTH connection')
       .setDesc(this.plugin.settings.notionToken
         ? `연결됨${this.plugin.settings.oauthWorkspaceName ? `: ${this.plugin.settings.oauthWorkspaceName}` : ''}`
         : '아직 연결되지 않았습니다.')
@@ -1307,15 +1373,15 @@ class NotionSyncSettingTab extends PluginSettingTab {
         .setButtonText('Disconnect')
         .onClick(() => this.plugin.disconnectOAuth()));
 
-    containerEl.createEl('h3', { text: 'Manual token fallback' });
+    new Setting(containerEl).setName('Manual token fallback').setHeading();
 
     new Setting(containerEl)
       .setName('Notion integration token')
-      .setDesc('OAuth를 쓰지 않을 때만 Internal Integration Token을 직접 입력합니다.')
+      .setDesc('OAUTH를 사용하지 않을 때만 내부 통합 토큰을 직접 입력합니다.')
       .addText((text) => {
         text.inputEl.type = 'password';
         text
-          .setPlaceholder('ntn_... 또는 secret_...')
+          .setPlaceholder('Enter token')
           .setValue(this.plugin.settings.notionToken)
           .onChange(async (value) => {
             this.plugin.settings.notionToken = value.trim();
@@ -1327,7 +1393,7 @@ class NotionSyncSettingTab extends PluginSettingTab {
       .setName('Notion parent page URL or ID')
       .setDesc('부모 페이지 URL을 붙여넣으면 32자리 page ID를 자동 추출합니다.')
       .addText((text) => text
-        .setPlaceholder('https://www.notion.so/... 또는 32자리 page id')
+        .setPlaceholder('Enter parent page URL or ID')
         .setValue(this.plugin.settings.parentPageInput || this.plugin.settings.parentPageId)
         .onChange(async (value) => {
           this.plugin.settings.parentPageInput = value.trim();
@@ -1337,7 +1403,7 @@ class NotionSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Notion API version')
-      .setDesc('file_uploads API를 사용하는 버전입니다. 보통 변경하지 마세요.')
+      .setDesc('File uploads API를 사용하는 버전입니다. 보통 변경하지 마세요.')
       .addText((text) => text
         .setValue(this.plugin.settings.notionVersion)
         .onChange(async (value) => {
